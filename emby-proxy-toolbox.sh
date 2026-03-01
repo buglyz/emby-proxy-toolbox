@@ -8,6 +8,10 @@ SITES_AVAIL="/etc/nginx/sites-available"
 SITES_ENAB="/etc/nginx/sites-enabled"
 BACKUP_ROOT="/root"
 
+# 默认保留备份数量（可通过环境变量 KEEP_BACKUPS 覆盖）
+# 注意：脚本启用了 `set -u`，未定义变量会直接报错；卸载/回滚路径会调用备份清理逻辑。
+KEEP_BACKUPS="${KEEP_BACKUPS:-5}"
+
 # 单站管理器
 SINGLE_PREFIX="emby-"
 SINGLE_HTPASSWD="/etc/nginx/.htpasswd-emby"
@@ -76,8 +80,8 @@ ensure_htpasswd_cmd() {
 
 prune_nginx_backup_dirs() {
   # 保留最近 keep 份 /root/nginx-backup-* 目录
-  local keep="${1:-$KEEP_BACKUPS}"
-  [[ "$keep" =~ ^[0-9]+$ ]] || keep="$KEEP_BACKUPS"
+  local keep="${1:-${KEEP_BACKUPS:-5}}"
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep="${KEEP_BACKUPS:-5}"
   (( keep >= 1 )) || keep=1
   ls -1dt "${BACKUP_ROOT}/nginx-backup-"* 2>/dev/null | tail -n +$((keep+1)) | while read -r d; do
     [[ -n "$d" ]] || continue
@@ -88,9 +92,9 @@ prune_nginx_backup_dirs() {
 prune_file_backups() {
   # 保留最近 keep 份 <file>.bak.<ts> 备份
   local base="$1"
-  local keep="${2:-$KEEP_BACKUPS}"
+  local keep="${2:-${KEEP_BACKUPS:-5}}"
   [[ -n "$base" ]] || return 0
-  [[ "$keep" =~ ^[0-9]+$ ]] || keep="$KEEP_BACKUPS"
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep="${KEEP_BACKUPS:-5}"
   (( keep >= 1 )) || keep=1
   ls -1dt "${base}.bak."* 2>/dev/null | tail -n +$((keep+1)) | while read -r f; do
     [[ -n "$f" ]] || continue
@@ -105,7 +109,7 @@ backup_nginx() {
   dir="${BACKUP_ROOT}/nginx-backup-${ts}"
   mkdir -p "$dir/nginx"
   rsync -a /etc/nginx/ "$dir/nginx/"
-  prune_nginx_backup_dirs "$KEEP_BACKUPS"
+  prune_nginx_backup_dirs "${KEEP_BACKUPS:-5}"
   echo "$dir"
 }
 restore_nginx() { local dir="$1"; rsync -a --delete "$dir/nginx/" /etc/nginx/; }
@@ -158,7 +162,7 @@ nginx_self_heal_compat() {
     while read -r f; do
       [[ -z "$f" ]] && continue
       cp -a "$f" "${f}.bak.${ts}"
-    prune_file_backups "$f" "$KEEP_BACKUPS"
+	    prune_file_backups "$f" "${KEEP_BACKUPS:-5}"
       sed -i '/\$http3\b/s/^/# /' "$f"
     done <<< "$http3_files"
     changed="y"
@@ -167,7 +171,7 @@ nginx_self_heal_compat() {
   # 注释 quic/http3/ssl_reject_handshake
   if grep -qiE '\b(quic_bpf|http3|ssl_reject_handshake)\b' "$main"; then
     cp -a "$main" "${main}.bak.${ts}"
-  prune_file_backups "$main" "$KEEP_BACKUPS"
+	prune_file_backups "$main" "${KEEP_BACKUPS:-5}"
     sed -i -E '
       s/^\s*quic_bpf\b/# quic_bpf/;
       s/^\s*http3\b/# http3/;
@@ -191,7 +195,7 @@ nginx_self_heal_compat() {
       END{exit 0;}
     ' "$main"; then
       cp -a "$main" "${main}.bak.${ts}"
-  prune_file_backups "$main" "$KEEP_BACKUPS"
+	prune_file_backups "$main" "${KEEP_BACKUPS:-5}"
       awk '
         BEGIN{state=0;lvl=0;match=0;}
         {
