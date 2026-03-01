@@ -298,15 +298,19 @@ single_write_site_conf() {
         ${auth_snip}proxy_pass $origin_scheme://$origin/;
 
         proxy_http_version 1.1;
-        proxy_set_header Host \$proxy_host;
+        proxy_set_header Host ${origin_host};
         proxy_set_header X-Forwarded-Host \$host;
 
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        set \$forwarded_proto \$scheme;
+        if (\$http_x_forwarded_proto != "") { set \$forwarded_proto \$http_x_forwarded_proto; }
+        proxy_set_header X-Forwarded-Proto \$forwarded_proto;
 
         proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
+        set \$emby_connection "close";
+        if (\$http_upgrade != "") { set \$emby_connection "upgrade"; }
+        proxy_set_header Connection \$emby_connection;
 
         proxy_set_header Range \$http_range;
         proxy_set_header If-Range \$http_if_range;
@@ -332,15 +336,19 @@ EOF
         ${auth_snip}proxy_pass $origin_scheme://$origin;
 
         proxy_http_version 1.1;
-        proxy_set_header Host \$proxy_host;
+        proxy_set_header Host ${origin_host};
         proxy_set_header X-Forwarded-Host \$host;
 
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        set \$forwarded_proto \$scheme;
+        if (\$http_x_forwarded_proto != "") { set \$forwarded_proto \$http_x_forwarded_proto; }
+        proxy_set_header X-Forwarded-Proto \$forwarded_proto;
 
         proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
+        set \$emby_connection "close";
+        if (\$http_upgrade != "") { set \$emby_connection "upgrade"; }
+        proxy_set_header Connection \$emby_connection;
 
         proxy_set_header Range \$http_range;
         proxy_set_header If-Range \$http_if_range;
@@ -364,10 +372,6 @@ EOF
 # Managed by ${TOOL_NAME}
 # META domain=${domain} origin=${origin_scheme}://${origin} subpath=${subpath} extra_ports=${safe_ports} basicauth=${enable_basicauth}
 
-map \$http_upgrade \$connection_upgrade {
-  default upgrade;
-  ''      close;
-}
 
 server {
   listen 80;
@@ -693,7 +697,7 @@ proxy_send_timeout 3600s;
 
 client_max_body_size 500m;
 
-resolver 127.0.0.1 1.1.1.1 8.8.8.8 valid=60s;
+resolver 1.1.1.1 8.8.8.8 9.9.9.9 223.5.5.5 ipv6=on valid=300s;
 resolver_timeout 5s;
 
 location ~ ^/http/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
@@ -717,6 +721,7 @@ __ALLOW_SNIP__
 
 
     proxy_ssl_server_name on;
+    proxy_ssl_name $up_host_only;
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
 
@@ -741,6 +746,7 @@ __ALLOW_SNIP__
 
 
     proxy_ssl_server_name on;
+    proxy_ssl_name $up_host_only;
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
 
@@ -765,6 +771,7 @@ __ALLOW_SNIP__
 
 
     proxy_ssl_server_name on;
+    proxy_ssl_name $up_host_only;
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
 EOF
