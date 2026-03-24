@@ -1172,8 +1172,8 @@ gw_rewrite_add_rule() {
   echo
   echo "请直接粘贴你抓包看到的“后端地址”（脚本自动分析）："
   echo "示例："
-  echo "  http://cflocal.xxlb.net/stream"
-  echo "  http://myg2.mobaiemby.site:2052"
+  echo "  http://media-backend.example.net/stream"
+  echo "  http://origin-node.example.org:2052"
   echo "  https://api.example.com:443/base"
   echo "你也可以只填 host 或 host:port 或 host/path（未写协议默认按 http 处理）"
   echo
