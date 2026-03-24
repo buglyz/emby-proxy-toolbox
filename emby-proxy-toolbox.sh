@@ -459,7 +459,7 @@ single_action_add_or_edit() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap 'rm -f "$dump"' RETURN
+  trap '[ -n "${dump:-}" ] && rm -f "${dump:-}"' RETURN
 
   set +e
   single_write_site_conf "$DOMAIN" "$ORIGIN_HOST" "$ORIGIN_PORT" "$ORIGIN_SCHEME" \
@@ -552,7 +552,7 @@ single_action_delete() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap 'rm -f "$dump"' RETURN
+  trap '[ -n "${dump:-}" ] && rm -f "${dump:-}"' RETURN
 
   rm -f "$enabled" "$conf"
   apply_with_rollback "$backup" "$dump" || return 1
@@ -962,7 +962,7 @@ gw_rewrite_apply_reload() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap 'rm -f "$dump"' RETURN
+  trap '[ -n "${dump:-}" ] && rm -f "${dump:-}"' RETURN
 
   gw_rewrite_render_snippet "$gw_domain"
   apply_with_rollback "$backup" "$dump" || return 1
@@ -1139,7 +1139,7 @@ gw_action_install_update() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap 'rm -f "$dump"' RETURN
+  trap '[ -n "${dump:-}" ] && rm -f "${dump:-}"' RETURN
 
   gw_write_map_conf
   gw_write_locations_snippet "$ENABLE_BASICAUTH" "$ENABLE_IPWL" "$IPWL"
@@ -1226,7 +1226,7 @@ gw_action_uninstall() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap 'rm -f "$dump"' RETURN
+  trap '[ -n "${dump:-}" ] && rm -f "${dump:-}"' RETURN
 
   rm -f "$enabled" "$conf" "$GW_MAP_CONF" "$GW_SNIP_CONF" "$GW_HTPASSWD" 2>/dev/null || true
   apply_with_rollback "$backup" "$dump" || true
