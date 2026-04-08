@@ -1,5 +1,12 @@
-﻿#!/usr/bin/env bash
+﻿#!/bin/sh
 # emby-proxy-toolbox.sh
+if [ -z "${BASH_VERSION:-}" ]; then
+  if command -v bash >/dev/null 2>&1; then
+    exec bash "$0" "$@"
+  fi
+  echo "This script requires bash. On Alpine, run: apk add --no-cache bash" >&2
+  exit 1
+fi
 set -euo pipefail
 # 一体化 Emby 反代工具箱（单站反代管理器 + 通用反代网关）
 
@@ -82,9 +89,11 @@ detect_platform() {
   if has_cmd apk; then
     PKG_MANAGER="apk"
     NGINX_SITE_DIR="/etc/nginx/http.d"
+    GW_MAP_CONF="${NGINX_SITE_DIR}/emby-gw-map.conf"
   elif has_cmd apt-get; then
     PKG_MANAGER="apt"
     NGINX_SITE_DIR="/etc/nginx/sites-available"
+    GW_MAP_CONF="/etc/nginx/conf.d/emby-gw-map.conf"
   else
     echo "不支持当前系统的包管理器，仅支持 apt-get 和 apk。"
     exit 1
@@ -92,7 +101,6 @@ detect_platform() {
 
   NGINX_SNIPPETS_DIR="/etc/nginx/snippets"
   NGINX_ACME_ROOT="/var/www/html"
-  GW_MAP_CONF="${NGINX_SITE_DIR}/emby-gw-map.conf"
   GW_SNIP_CONF="${NGINX_SNIPPETS_DIR}/emby-gw-locations.conf"
 }
 
