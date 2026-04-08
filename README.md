@@ -37,14 +37,14 @@
 
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/bear4f/emby-proxy-toolbox/main/emby-proxy-toolbox.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/buglyz/emby-proxy-toolbox/refs/heads/main/emby-proxy-toolbox.sh)"
 ````
 
 ### 方式 B：下载后运行
 
 ```bash
 curl -fsSL -o emby-proxy-toolbox.sh \
-  https://raw.githubusercontent.com/bear4f/emby-proxy-toolbox/main/emby-proxy-toolbox.sh
+  https://raw.githubusercontent.com/buglyz/emby-proxy-toolbox/refs/heads/main/emby-proxy-toolbox.sh
 
 chmod +x emby-proxy-toolbox.sh
 sudo ./emby-proxy-toolbox.sh
