@@ -1,12 +1,16 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # emby-proxy-toolbox.sh
-# 一体化 Emby 反代工具箱（单站反代管理器 + 通用反代网关）
 set -euo pipefail
+# 一体化 Emby 反代工具箱（单站反代管理器 + 通用反代网关）
 
 # -------------------- 通用配置 --------------------
-SITES_AVAIL="/etc/nginx/sites-available"
-SITES_ENAB="/etc/nginx/sites-enabled"
 BACKUP_ROOT="/root"
+DISTRO_ID=""
+DISTRO_NAME=""
+PKG_MANAGER=""
+NGINX_SITE_DIR=""
+NGINX_SNIPPETS_DIR=""
+NGINX_ACME_ROOT=""
 
 # 单站管理器
 SINGLE_PREFIX="emby-"
@@ -14,14 +18,14 @@ SINGLE_HTPASSWD="/etc/nginx/.htpasswd-emby"
 
 # 通用网关
 GW_PREFIX="emby-gw-"
-GW_MAP_CONF="/etc/nginx/conf.d/emby-gw-map.conf"
-GW_SNIP_CONF="/etc/nginx/snippets/emby-gw-locations.conf"
+GW_MAP_CONF=""
+GW_SNIP_CONF=""
 GW_HTPASSWD="/etc/nginx/.htpasswd-emby-gw"
 
 TOOL_NAME="emby-proxy-toolbox"
 # ------------------------------------------------
 
-need_root() { [[ "${EUID}" -eq 0 ]] || { echo "请用 root 运行：sudo bash $0"; exit 1; }; }
+need_root() { [[ "${EUID}" -eq 0 ]] || { echo "请使用 root 运行：sudo bash $0"; exit 1; }; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 prompt() {
@@ -63,15 +67,68 @@ os_info() {
   echo "$name|$ver|$codename"
 }
 
-apt_install() { export DEBIAN_FRONTEND=noninteractive; apt-get update -y >/dev/null; apt-get install -y "$@" >/dev/null; }
-ensure_deps() { apt_install nginx curl ca-certificates rsync apache2-utils openssl; }
-ensure_certbot() { apt_install certbot python3-certbot-nginx; }
+detect_platform() {
+  local id="unknown" name="unknown"
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    id="${ID:-unknown}"
+    name="${NAME:-unknown}"
+  fi
+
+  DISTRO_ID="$id"
+  DISTRO_NAME="$name"
+
+  if has_cmd apk; then
+    PKG_MANAGER="apk"
+    NGINX_SITE_DIR="/etc/nginx/http.d"
+  elif has_cmd apt-get; then
+    PKG_MANAGER="apt"
+    NGINX_SITE_DIR="/etc/nginx/sites-available"
+  else
+    echo "不支持当前系统的包管理器，仅支持 apt-get 和 apk。"
+    exit 1
+  fi
+
+  NGINX_SNIPPETS_DIR="/etc/nginx/snippets"
+  NGINX_ACME_ROOT="/var/www/html"
+  GW_MAP_CONF="${NGINX_SITE_DIR}/emby-gw-map.conf"
+  GW_SNIP_CONF="${NGINX_SNIPPETS_DIR}/emby-gw-locations.conf"
+}
+
+pkg_install() {
+  if [[ "$PKG_MANAGER" == "apt" ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null
+    apt-get install -y "$@" >/dev/null
+  elif [[ "$PKG_MANAGER" == "apk" ]]; then
+    apk add --no-cache "$@" >/dev/null
+  else
+    echo "不支持的包管理器：$PKG_MANAGER"
+    return 1
+  fi
+}
+
+ensure_deps() {
+  pkg_install nginx curl ca-certificates rsync openssl
+}
+
+ensure_certbot() {
+  if [[ "$PKG_MANAGER" == "apt" ]]; then
+    pkg_install certbot python3-certbot-nginx
+  elif [[ "$PKG_MANAGER" == "apk" ]]; then
+    pkg_install certbot certbot-nginx
+  fi
+}
+
+write_htpasswd_file() {
+  local file="$1" user="$2" pass="$3" hash=""
+  hash="$(openssl passwd -apr1 "$pass")"
+  printf '%s:%s\n' "$user" "$hash" >"$file"
+}
 
 ensure_htpasswd_cmd() {
-  if ! has_cmd htpasswd; then
-    echo "未检测到 htpasswd，正在安装 apache2-utils..."
-    apt_install apache2-utils
-  fi
+  return 0
 }
 
 backup_nginx() {
@@ -85,7 +142,31 @@ backup_nginx() {
 restore_nginx() { local dir="$1"; rsync -a --delete "$dir/nginx/" /etc/nginx/; }
 
 validate_nginx() { local dumpfile="$1"; nginx -t >/dev/null; nginx -T >"$dumpfile" 2>/dev/null; }
-reload_nginx() { systemctl enable nginx >/dev/null 2>&1 || true; systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true; }
+
+enable_nginx_service() {
+  systemctl enable nginx >/dev/null 2>&1 && return 0
+  rc-update add nginx default >/dev/null 2>&1 && return 0
+  return 0
+}
+
+reload_nginx() {
+  enable_nginx_service
+  systemctl reload nginx >/dev/null 2>&1 && return 0
+  systemctl restart nginx >/dev/null 2>&1 && return 0
+  rc-service nginx reload >/dev/null 2>&1 && return 0
+  rc-service nginx restart >/dev/null 2>&1 && return 0
+  service nginx reload >/dev/null 2>&1 && return 0
+  service nginx restart >/dev/null 2>&1 && return 0
+  nginx -s reload >/dev/null 2>&1 && return 0
+  return 0
+}
+
+status_nginx() {
+  systemctl status nginx --no-pager >/dev/null 2>&1 && { systemctl status nginx --no-pager; return 0; }
+  rc-service nginx status >/dev/null 2>&1 && { rc-service nginx status; return 0; }
+  service nginx status >/dev/null 2>&1 && { service nginx status; return 0; }
+  echo "当前系统无法获取 nginx 服务状态。"
+}
 
 apply_with_rollback() {
   local backup_dir="$1" dumpfile="$2"
@@ -95,7 +176,7 @@ apply_with_rollback() {
   set -e
   if [[ $rc -ne 0 ]]; then
     echo "❌ nginx 校验失败（nginx -t/-T），开始回滚..."
-    echo "---- nginx -T 输出（含错误）已保存：$dumpfile ----"
+    echo "---- nginx -T 输出已保存到：$dumpfile ----"
     restore_nginx "$backup_dir"
     nginx -t >/dev/null 2>&1 || true
     reload_nginx
@@ -106,6 +187,7 @@ apply_with_rollback() {
 }
 
 ensure_sites_enabled_include() {
+  [[ "$PKG_MANAGER" == "apk" ]] && return 0
   local main="/etc/nginx/nginx.conf"
   [[ -f "$main" ]] || return 0
   grep -qE 'include\s+/etc/nginx/sites-enabled/\*;' "$main" && return 0
@@ -125,7 +207,7 @@ nginx_self_heal_compat() {
   changed="n"
   [[ -f "$main" ]] || return 0
 
-  # 注释 $http3
+  # 注释掉不兼容的 $http3
   local http3_files
   http3_files="$(grep -RIl '\$http3\b' /etc/nginx 2>/dev/null || true)"
   if [[ -n "$http3_files" ]]; then
@@ -137,7 +219,7 @@ nginx_self_heal_compat() {
     changed="y"
   fi
 
-  # 注释 quic/http3/ssl_reject_handshake
+  # 注释掉不兼容的 quic/http3/ssl_reject_handshake
   if grep -qiE '\b(quic_bpf|http3|ssl_reject_handshake)\b' "$main"; then
     cp -a "$main" "${main}.bak.${ts}"
     sed -i -E '
@@ -149,7 +231,7 @@ nginx_self_heal_compat() {
     changed="y"
   fi
 
-  # 删除 nginx.conf 中 443 ssl default_server 但无证书的 server{}
+  # 删除 nginx.conf 中监听 443 但未配置证书的 default_server
   if grep -qE 'listen\s+443\s+ssl\s+default_server' "$main"; then
     if ! awk '
       BEGIN{inside=0;has_listen=0;has_cert=0;}
@@ -197,7 +279,7 @@ nginx_self_heal_compat() {
   ensure_sites_enabled_include || true
 
   if [[ "$changed" == "y" ]]; then
-    nginx -t >/dev/null 2>&1 && (systemctl restart nginx >/dev/null 2>&1 || true)
+    nginx -t >/dev/null 2>&1 && reload_nginx
   fi
 }
 
@@ -205,15 +287,22 @@ certbot_enable_tls() {
   local domain="$1" email="$2"
   ensure_certbot
   ensure_sites_enabled_include
-  nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+  nginx -t >/dev/null 2>&1 && reload_nginx || true
   certbot --nginx -d "$domain" --agree-tos -m "$email" --non-interactive --redirect
 }
 
 random_pass() { openssl rand -hex 10 2>/dev/null; }
 
 # ========================= 单站反代 =========================
-single_conf_path_for_domain() { local d="$1"; echo "${SITES_AVAIL}/${SINGLE_PREFIX}$(sanitize_name "$d").conf"; }
-single_enabled_path_for_domain(){ local d="$1"; echo "${SITES_ENAB}/${SINGLE_PREFIX}$(sanitize_name "$d").conf"; }
+single_conf_path_for_domain() { local d="$1"; echo "${NGINX_SITE_DIR}/${SINGLE_PREFIX}$(sanitize_name "$d").conf"; }
+single_enabled_path_for_domain() {
+  local d="$1"
+  if [[ "$PKG_MANAGER" == "apk" ]]; then
+    echo "${NGINX_SITE_DIR}/${SINGLE_PREFIX}$(sanitize_name "$d").conf"
+  else
+    echo "/etc/nginx/sites-enabled/${SINGLE_PREFIX}$(sanitize_name "$d").conf"
+  fi
+}
 
 warn_cf_ports_http_only() {
   local ports_csv; ports_csv="$(normalize_ports_csv "${1:-}")"
@@ -223,7 +312,7 @@ warn_cf_ports_http_only() {
   for p in "${arr[@]}"; do
     [[ -z "$p" ]] && continue
     for a in $ok; do [[ "$p" == "$a" ]] && continue 2; done
-    echo "⚠️ 提示：端口 ${p} 可能不被 Cloudflare 小黄云代理支持。开启橙云后若不可用：改用 8080/8880/2052/2082/2086/2095 或灰云直连。"
+    echo "提示：端口 ${p} 可能不受 Cloudflare 代理支持，必要时改用 8080/8880/2052/2082/2086/2095 或直接灰云。"
   done
 }
 
@@ -241,8 +330,7 @@ single_write_site_conf() {
 
   auth_snip=""
   if [[ "$enable_basicauth" == "y" ]]; then
-    ensure_htpasswd_cmd
-    htpasswd -bc "$SINGLE_HTPASSWD" "$basic_user" "$basic_pass" >/dev/null
+    write_htpasswd_file "$SINGLE_HTPASSWD" "$basic_user" "$basic_pass"
     auth_snip=$'auth_basic "Restricted";\n        auth_basic_user_file '"$SINGLE_HTPASSWD"$';\n'
   fi
 
@@ -338,7 +426,7 @@ EOF
     IFS=',' read -r -a ports <<<"$safe_ports"
     for p in "${ports[@]}"; do
       [[ -z "$p" ]] && continue
-      is_port "$p" || { echo "端口非法：$p"; return 1; }
+      is_port "$p" || { echo "端口不合法：$p"; return 1; }
       [[ "$p" == "80" || "$p" == "443" ]] && { echo "额外端口不允许使用 80/443：$p"; return 1; }
       cat >>"$conf" <<EOF
 
@@ -352,8 +440,11 @@ EOF
     done
   fi
 
-  ln -sf "$conf" "$enabled"
-  rm -f "${SITES_ENAB}/default" >/dev/null 2>&1 || true
+  if [[ "$enabled" != "$conf" ]]; then
+    mkdir -p "$(dirname "$enabled")"
+    ln -sf "$conf" "$enabled"
+    rm -f "/etc/nginx/sites-enabled/default" >/dev/null 2>&1 || true
+  fi
 }
 
 single_print_usage_hint() {
@@ -363,7 +454,7 @@ single_print_usage_hint() {
   if [[ "$subpath" != "/" && -n "$subpath" ]]; then main="${main}${subpath}"; else main="${main}/"; fi
 
   echo
-  echo "================ 使用方法 ================"
+  echo "================ 使用方式 ================"
   echo "主入口："
   echo "  浏览器：${main}"
   echo "  Emby 客户端：服务器地址填 ${main%/}"
@@ -379,7 +470,7 @@ single_print_usage_hint() {
     done
   fi
   echo
-  echo "注意：IP + HTTPS 会证书不匹配（正常），推荐域名 + HTTPS。"
+  echo "注意：IP + HTTPS 证书不会匹配，这是正常现象，建议使用域名 + HTTPS。"
   echo "=========================================="
   echo
 }
@@ -390,22 +481,22 @@ single_action_add_or_edit() {
   local ENABLE_BASICAUTH BASIC_USER BASIC_PASS
   local USE_SUBPATH SUBPATH UPSTREAM_INSECURE EXTRA_PORTS
 
-  prompt DOMAIN "访问域名（只填域名，不要 https://）"
+  prompt DOMAIN "访问域名（只填域名，不要带 https://）"
   DOMAIN="$(strip_scheme "$DOMAIN")"
-  prompt ORIGIN_HOST "源站域名或IP（可误输 http(s)://，会自动去掉）"
+  prompt ORIGIN_HOST "源站域名或 IP（可输入 http(s)://，会自动去掉）"
   ORIGIN_HOST="$(strip_scheme "$ORIGIN_HOST")"
   prompt ORIGIN_PORT "源站端口" "8096"
   is_port "$ORIGIN_PORT" || { echo "端口不合法：$ORIGIN_PORT"; return 1; }
   prompt ORIGIN_SCHEME "源站协议 http/https" "http"
   [[ "$ORIGIN_SCHEME" == "http" || "$ORIGIN_SCHEME" == "https" ]] || { echo "协议只能是 http 或 https"; return 1; }
 
-  yesno ENABLE_SSL "为主入口申请 Let's Encrypt（启用 443 并 80->443）" "y"
+  yesno ENABLE_SSL "为主入口申请 Let's Encrypt（启用 443 并 80 跳转 443）" "y"
   EMAIL="admin@${DOMAIN}"
   [[ "$ENABLE_SSL" == "y" ]] && prompt EMAIL "证书邮箱" "$EMAIL"
 
-  yesno ENABLE_UFW "自动用 UFW 放通 80/443 + 额外端口（不影响云安全组）" "n"
+  yesno ENABLE_UFW "自动使用 UFW 放行 80/443 和额外端口（不影响云安全组）" "n"
 
-  yesno ENABLE_BASICAUTH "启用 BasicAuth（额外一层门禁，可选）" "n"
+  yesno ENABLE_BASICAUTH "启用 BasicAuth（额外一层访问密码，可选）" "n"
   BASIC_USER="emby"; BASIC_PASS=""
   if [[ "$ENABLE_BASICAUTH" == "y" ]]; then
     prompt BASIC_USER "BasicAuth 用户名" "emby"
@@ -415,24 +506,24 @@ single_action_add_or_edit() {
   yesno USE_SUBPATH "使用子路径（例如 /emby）" "n"
   SUBPATH="/"
   if [[ "$USE_SUBPATH" == "y" ]]; then
-    prompt SUBPATH "子路径（以 / 开头，不以 / 结尾）" "/emby"
+    prompt SUBPATH "子路径（以 / 开头，且不以 / 结尾）" "/emby"
     [[ "$SUBPATH" == /* ]] || SUBPATH="/$SUBPATH"
     [[ "$SUBPATH" != */ ]] || { echo "子路径不能以 / 结尾"; return 1; }
   fi
 
   UPSTREAM_INSECURE="n"
   if [[ "$ORIGIN_SCHEME" == "https" ]]; then
-    yesno UPSTREAM_INSECURE "源站 HTTPS 为自签/不受信证书（跳过验证）" "n"
+    yesno UPSTREAM_INSECURE "源站 HTTPS 为自签或不受信证书（跳过校验）" "n"
   fi
 
-  prompt EXTRA_PORTS "额外端口入口（逗号分隔，可空；如 18443,28096）" ""
+  prompt EXTRA_PORTS "额外端口入口（逗号分隔，可留空，例如 18443,28096）" ""
   EXTRA_PORTS="$(normalize_ports_csv "$EXTRA_PORTS")"
   if [[ -n "${EXTRA_PORTS// /}" ]]; then
     IFS=',' read -r -a arr <<<"$EXTRA_PORTS"
     for p in "${arr[@]}"; do
       [[ -z "$p" ]] && continue
       is_port "$p" || { echo "额外端口不合法：$p"; return 1; }
-      [[ "$p" == "80" || "$p" == "443" ]] && { echo "额外端口不能用 80/443：$p"; return 1; }
+      [[ "$p" == "80" || "$p" == "443" ]] && { echo "额外端口不能使用 80/443：$p"; return 1; }
     done
   fi
 
@@ -441,7 +532,7 @@ single_action_add_or_edit() {
   echo
   echo "---- 配置确认 ----"
   echo "入口域名:     $DOMAIN"
-  echo "回源:         $ORIGIN_SCHEME://$ORIGIN_HOST:$ORIGIN_PORT"
+  echo "回源地址:     $ORIGIN_SCHEME://$ORIGIN_HOST:$ORIGIN_PORT"
   echo "子路径:       $SUBPATH"
   echo "主入口 HTTPS: $ENABLE_SSL"
   echo "BasicAuth:    $ENABLE_BASICAUTH"
@@ -467,7 +558,7 @@ single_action_add_or_edit() {
   local rc_write=$?
   set -e
   if [[ $rc_write -ne 0 ]]; then
-    echo "❌ 写入配置失败，回滚..."
+    echo "❌ 写入配置失败，开始回滚..."
     restore_nginx "$backup"
     reload_nginx
     return 1
@@ -476,12 +567,16 @@ single_action_add_or_edit() {
   apply_with_rollback "$backup" "$dump" || return 1
 
   if [[ "$ENABLE_UFW" == "y" ]]; then
-    if ! has_cmd ufw; then apt_install ufw; fi
-    ufw allow 80/tcp >/dev/null || true
-    ufw allow 443/tcp >/dev/null || true
-    if [[ -n "${EXTRA_PORTS// /}" ]]; then
-      IFS=',' read -r -a arr <<<"$EXTRA_PORTS"
-      for p in "${arr[@]}"; do [[ -z "$p" ]] && continue; ufw allow "${p}/tcp" >/dev/null || true; done
+    if has_cmd ufw || [[ "$PKG_MANAGER" == "apt" ]]; then
+      if ! has_cmd ufw; then pkg_install ufw; fi
+      ufw allow 80/tcp >/dev/null || true
+      ufw allow 443/tcp >/dev/null || true
+      if [[ -n "${EXTRA_PORTS// /}" ]]; then
+        IFS=',' read -r -a arr <<<"$EXTRA_PORTS"
+        for p in "${arr[@]}"; do [[ -z "$p" ]] && continue; ufw allow "${p}/tcp" >/dev/null || true; done
+      fi
+    else
+      echo "UFW not available on ${DISTRO_NAME}; skipping firewall changes."
     fi
   fi
 
@@ -491,7 +586,7 @@ single_action_add_or_edit() {
     local rc_cert=$?
     set -e
     if [[ $rc_cert -ne 0 ]]; then
-      echo "❌ certbot 配置失败，回滚..."
+      echo "❌ certbot 配置失败，开始回滚..."
       restore_nginx "$backup"
       reload_nginx
       return 1
@@ -502,14 +597,14 @@ single_action_add_or_edit() {
   echo "✅ 已生效：$DOMAIN"
   echo "站点配置：$(single_conf_path_for_domain "$DOMAIN")"
   echo "备份目录：$backup"
-  [[ "$USE_SUBPATH" == "y" ]] && echo "⚠️ 子路径：建议在 Emby 后台 Base URL 设置为 $SUBPATH 并重启 Emby。"
+  [[ "$USE_SUBPATH" == "y" ]] && echo "提示：建议在 Emby 后台把 Base URL 设置为 $SUBPATH，并重启 Emby。"
   single_print_usage_hint "$DOMAIN" "$SUBPATH" "$ENABLE_SSL" "$EXTRA_PORTS"
 }
 
 single_action_list() {
-  echo "=== 现有单站反代（${SITES_AVAIL}/${SINGLE_PREFIX}*.conf）==="
+  echo "=== 现有单站反代（${NGINX_SITE_DIR}/${SINGLE_PREFIX}*.conf）==="
   shopt -s nullglob
-  local files=("${SITES_AVAIL}/${SINGLE_PREFIX}"*.conf)
+  local files=("${NGINX_SITE_DIR}/${SINGLE_PREFIX}"*.conf)
   if [[ ${#files[@]} -eq 0 ]]; then echo "（空）"; return 0; fi
   for f in "${files[@]}"; do
     local meta domain origin subpath ports basicauth
@@ -540,7 +635,7 @@ single_action_delete() {
   conf="$(single_conf_path_for_domain "$DOMAIN")"
   enabled="$(single_enabled_path_for_domain "$DOMAIN")"
 
-  if [[ ! -f "$conf" && ! -L "$enabled" ]]; then echo "没找到该站点：$DOMAIN"; return 1; fi
+  if [[ ! -f "$conf" && ! -L "$enabled" ]]; then echo "未找到该站点：$DOMAIN"; return 1; fi
   yesno DEL_CERT "是否同时删除证书（仍需你手动执行 certbot delete）" "n"
 
   ensure_deps
@@ -558,7 +653,7 @@ single_action_delete() {
   echo "✅ 已删除站点：$DOMAIN"
   echo "备份目录：$backup"
   if [[ "$DEL_CERT" == "y" ]] && has_cmd certbot; then
-    echo "证书删除请手动执行：certbot delete --cert-name $DOMAIN"
+    echo "如需删除证书，请手动执行：certbot delete --cert-name $DOMAIN"
   fi
 }
 
@@ -572,7 +667,7 @@ single_menu() {
     echo "========== 单站菜单 =========="
     echo "1) 添加/覆盖单站反代（可选额外端口）"
     echo "2) 查看现有单站反代"
-    echo "3) 修改单站反代（= 覆盖同域名）"
+    echo "3) 修改单站反代（覆盖同域名）"
     echo "4) 删除单站反代"
     echo "5) Nginx 测试与状态"
     echo "0) 返回上级"
@@ -583,7 +678,7 @@ single_menu() {
       2) single_action_list ;;
       3) single_action_add_or_edit ;;
       4) single_action_delete ;;
-      5) echo "nginx -t：" && nginx -t && echo && (systemctl status nginx --no-pager || true) ;;
+      5) echo "nginx -t：" && nginx -t && echo && (status_nginx || true) ;;
       0) return 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -591,14 +686,21 @@ single_menu() {
 }
 
 # ========================= 通用网关 =========================
-gw_conf_path_for_domain() { local d="$1"; echo "${SITES_AVAIL}/${GW_PREFIX}$(sanitize_name "$d").conf"; }
-gw_enabled_path_for_domain(){ local d="$1"; echo "${SITES_ENAB}/${GW_PREFIX}$(sanitize_name "$d").conf"; }
+gw_conf_path_for_domain() { local d="$1"; echo "${NGINX_SITE_DIR}/${GW_PREFIX}$(sanitize_name "$d").conf"; }
+gw_enabled_path_for_domain() {
+  local d="$1"
+  if [[ "$PKG_MANAGER" == "apk" ]]; then
+    echo "${NGINX_SITE_DIR}/${GW_PREFIX}$(sanitize_name "$d").conf"
+  else
+    echo "/etc/nginx/sites-enabled/${GW_PREFIX}$(sanitize_name "$d").conf"
+  fi
+}
 
 gw_write_map_conf() {
-  mkdir -p /etc/nginx/conf.d
+  mkdir -p "$NGINX_SITE_DIR"
   cat > "$GW_MAP_CONF" <<'EOF'
 # Managed by emby-proxy-toolbox (universal gateway)
-# Loaded under http{} via /etc/nginx/conf.d/*.conf
+# Loaded under http{} via nginx site include
 
 map $http_upgrade $connection_upgrade {
   default upgrade;
@@ -615,7 +717,7 @@ EOF
 gw_write_locations_snippet() {
   local enable_basicauth="$1" enable_ip_whitelist="$2" whitelist_csv="$3"
 
-  mkdir -p /etc/nginx/snippets
+  mkdir -p "$NGINX_SNIPPETS_DIR"
 
   # build auth/allow blocks into temp files (no awk; avoids multiline escaping issues)
   local tmp_auth tmp_allow
@@ -648,7 +750,7 @@ EOF
 
   cat > "$GW_SNIP_CONF" <<'EOF'
 # Managed by emby-proxy-toolbox (universal gateway)
-# Included inside server{} (这里不能出现 map 指令)
+# Included inside server{}（这里不能出现 map 指令）
 
 proxy_http_version 1.1;
 
@@ -693,7 +795,7 @@ location ~ ^/http/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
 
     # Rewrite redirects back to gateway to prevent client bypass.
     # Many clients require ABSOLUTE Location; we emit https://$host/...
-    # NOTE: 不要同时使用 `proxy_redirect off` 和其他 proxy_redirect 规则，否则会触发“directive is duplicate”。
+    # NOTE: 不要同时使用 `proxy_redirect off` 和其他 proxy_redirect 规则，否则会触发 duplicate 错误。
     proxy_redirect ~^http://([^/]+)(/.*)$  https://$host/http/$1$2;
     proxy_redirect ~^https://([^/]+)(/.*)$ https://$host/https/$1$2;
     proxy_redirect ~^/(.*)$               https://$host/http/$up_target/$1;
@@ -780,21 +882,24 @@ server {
   server_name ${domain};
 
   location ^~ /.well-known/acme-challenge/ {
-    root /var/www/html;
+    root ${NGINX_ACME_ROOT};
     try_files \$uri =404;
   }
 
   location = / {
     default_type text/plain;
-    return 200 "OK\\n\\n通用反代网关使用方式（填写到 Emby 客户端“服务器地址”）：\\n\\n  https://${domain}/<上游主机:端口>\\n  https://${domain}/http/<上游主机:端口>\\n\\n说明：默认按 https 回源；若需要 http 回源用 /http 前缀。\\n\\n安全提示：建议开启 BasicAuth 或 IP 白名单，避免 OPEN PROXY。\\n";
+    return 200 "OK\\n\\n通用反代网关使用方法（填到 Emby 客户端服务器地址）：\\n\\n  https://${domain}/<上游主机:端口>\\n  https://${domain}/http/<上游主机:端口>\\n\\n说明：默认按 https 回源；如果上游是 http，请使用 /http 前缀。\\n\\n安全提示：建议开启 BasicAuth 或 IP 白名单，避免 OPEN PROXY。\\n";
   }
 
-  include /etc/nginx/snippets/emby-gw-locations.conf;
+  include ${GW_SNIP_CONF};
 }
 EOF
 
-  ln -sf "$conf" "$enabled"
-  rm -f "${SITES_ENAB}/default" >/dev/null 2>&1 || true
+  if [[ "$enabled" != "$conf" ]]; then
+    mkdir -p "$(dirname "$enabled")"
+    ln -sf "$conf" "$enabled"
+    rm -f "/etc/nginx/sites-enabled/default" >/dev/null 2>&1 || true
+  fi
 }
 
 gw_print_usage() {
@@ -806,15 +911,15 @@ gw_print_usage() {
   echo "  ${base}/<上游主机:端口>        （默认按 https 回源）"
   echo "  ${base}/http/<上游主机:端口>   （强制 http 回源）"
   echo
-  echo "示例（仅示意，非真实地址）："
+  echo "示例："
   echo "  ${base}/example.com:443"
   echo "  ${base}/http/203.0.113.10:8096"
   echo
   if [[ -n "$user" ]]; then
-    echo "已开启 BasicAuth（网关额外门禁；不影响上游 Emby 自身账号密码）："
+    echo "已开启 BasicAuth（网关额外一层密码，不影响上游 Emby 账号密码）："
     echo "  用户名: $user"
     echo "  密码:   $pass"
-    echo "注意：部分客户端（如某些 SenPlayer/Forward 组合）不支持 BasicAuth，会导致无法使用。"
+    echo "注意：部分客户端或转发器不支持 BasicAuth，可能导致无法使用。"
   else
     echo "未开启 BasicAuth。"
   fi
@@ -824,15 +929,15 @@ gw_print_usage() {
 
 gw_action_install_update() {
   local DOMAIN ENABLE_SSL EMAIL ENABLE_BASICAUTH BASIC_USER BASIC_PASS ENABLE_IPWL IPWL ok
-  prompt DOMAIN "你的网关入口域名（例如 autoemby.example.com；只填域名，不要 https://）"
+  prompt DOMAIN "你的网关入口域名（例如 autoemby.example.com，只填域名，不要带 https://）"
   DOMAIN="$(strip_scheme "$DOMAIN")"
   [[ -n "$DOMAIN" ]] || { echo "域名不能为空"; return 1; }
 
-  yesno ENABLE_SSL "为网关域名申请 Let's Encrypt（启用 443 并 80->443）" "y"
+  yesno ENABLE_SSL "为网关域名申请 Let's Encrypt（启用 443 并 80 跳转 443）" "y"
   EMAIL="admin@${DOMAIN}"
   [[ "$ENABLE_SSL" == "y" ]] && prompt EMAIL "证书邮箱" "$EMAIL"
 
-  yesno ENABLE_BASICAUTH "启用 BasicAuth（强烈建议；但注意部分客户端不支持）" "y"
+  yesno ENABLE_BASICAUTH "启用 BasicAuth（强烈建议，但部分客户端可能不支持）" "y"
   BASIC_USER="emby"; BASIC_PASS=""
   if [[ "$ENABLE_BASICAUTH" == "y" ]]; then
     prompt BASIC_USER "BasicAuth 用户名" "emby"
@@ -848,7 +953,7 @@ gw_action_install_update() {
   fi
 
   if [[ "$ENABLE_BASICAUTH" == "n" && "$ENABLE_IPWL" == "n" ]]; then
-    echo "⚠️ 警告：你同时关闭了 BasicAuth 和 IP 白名单，这会把网关变成 OPEN PROXY（高风险）。"
+    echo "警告：你同时关闭了 BasicAuth 和 IP 白名单，这会把网关变成开放代理（高风险）。"
     yesno ok "仍要继续安装吗" "n"
     [[ "$ok" == "y" ]] || { echo "已取消"; return 0; }
   fi
@@ -867,8 +972,7 @@ gw_action_install_update() {
   nginx_self_heal_compat
 
   if [[ "$ENABLE_BASICAUTH" == "y" ]]; then
-    ensure_htpasswd_cmd
-    htpasswd -bc "$GW_HTPASSWD" "$BASIC_USER" "$BASIC_PASS" >/dev/null
+    write_htpasswd_file "$GW_HTPASSWD" "$BASIC_USER" "$BASIC_PASS"
   fi
 
   local backup dump
@@ -888,7 +992,7 @@ gw_action_install_update() {
     local rc=$?
     set -e
     if [[ $rc -ne 0 ]]; then
-      echo "❌ certbot 配置失败，回滚..."
+      echo "❌ certbot 配置失败，开始回滚..."
       restore_nginx "$backup"
       reload_nginx
       return 1
@@ -904,15 +1008,15 @@ gw_action_install_update() {
 
 gw_action_status() {
   echo "=== 通用网关状态 ==="
-  ls -l "${SITES_AVAIL}/${GW_PREFIX}"*.conf 2>/dev/null || echo "（未发现网关站点配置）"
+  ls -l "${NGINX_SITE_DIR}/${GW_PREFIX}"*.conf 2>/dev/null || echo "（未发现网关站点配置）"
   echo
   nginx -t || true
   echo
-  systemctl status nginx --no-pager || true
+  status_nginx || true
   echo
   [[ -f "$GW_MAP_CONF" ]] && echo "Map 文件：$GW_MAP_CONF（存在）" || echo "Map 文件：$GW_MAP_CONF（缺失）"
-  [[ -f "$GW_SNIP_CONF" ]] && echo "Snippet： $GW_SNIP_CONF（存在）" || echo "Snippet： $GW_SNIP_CONF（缺失）"
-  [[ -f "$GW_HTPASSWD" ]] && echo "BasicAuth：$GW_HTPASSWD（存在）" || echo "BasicAuth：$GW_HTPASSWD（缺失/未启用）"
+  [[ -f "$GW_SNIP_CONF" ]] && echo "Snippet：$GW_SNIP_CONF（存在）" || echo "Snippet：$GW_SNIP_CONF（缺失）"
+  [[ -f "$GW_HTPASSWD" ]] && echo "BasicAuth：$GW_HTPASSWD（存在）" || echo "BasicAuth：$GW_HTPASSWD（缺失或未启用）"
 }
 
 gw_action_change_auth() {
@@ -923,13 +1027,12 @@ gw_action_change_auth() {
     return 1
   fi
   ensure_deps
-  ensure_htpasswd_cmd
   prompt user "新的 BasicAuth 用户名" "emby"
   pass="$(random_pass)"
   prompt pass "新的 BasicAuth 密码（直接回车=自动生成）" "$pass"
-  htpasswd -bc "$GW_HTPASSWD" "$user" "$pass" >/dev/null
+  write_htpasswd_file "$GW_HTPASSWD" "$user" "$pass"
   reload_nginx
-  echo "✅ 已更新 BasicAuth："
+  echo "✅ 已更新 BasicAuth。"
   echo "  用户名: $user"
   echo "  密码:   $pass"
 }
@@ -965,7 +1068,7 @@ gw_action_uninstall() {
   apply_with_rollback "$backup" "$dump" || true
 
   echo "✅ 已卸载网关。备份目录：$backup"
-  echo "如需删除证书请手动执行：certbot delete --cert-name $DOMAIN"
+  echo "如需删除证书，请手动执行：certbot delete --cert-name $DOMAIN"
 }
 
 gw_menu() {
@@ -977,9 +1080,9 @@ gw_menu() {
   echo
   while true; do
     echo "========== 网关菜单 =========="
-    echo "1) 安装/更新 通用反代网关"
+    echo "1) 安装/更新通用反代网关"
     echo "2) 查看状态"
-    echo "3) 修改 BasicAuth 账号/密码"
+    echo "3) 修改 BasicAuth 用户名/密码"
     echo "4) 卸载"
     echo "0) 返回上级"
     echo "=============================="
@@ -1017,4 +1120,5 @@ main_menu() {
 }
 
 need_root
+detect_platform
 main_menu
