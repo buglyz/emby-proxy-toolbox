@@ -1,4 +1,4 @@
-﻿#!/bin/sh
+#!/bin/sh
 # emby-proxy-toolbox.sh
 if [ -z "${BASH_VERSION:-}" ]; then
   if command -v bash >/dev/null 2>&1; then
