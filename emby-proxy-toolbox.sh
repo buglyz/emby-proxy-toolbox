@@ -7,7 +7,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-read -rp "请输入域名（例如 auto.fleey.site）: " DOMAIN
+read -rp "请输入域名（例如 auto.emby.com）: " DOMAIN
 if [[ -z "${DOMAIN}" ]]; then
   echo "域名不能为空"
   exit 1
